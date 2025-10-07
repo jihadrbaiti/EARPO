@@ -18,3 +18,7 @@ pip install pip==24.3.1
 ```python
 pip install -r requirements.txt
 ```
+### Training Examples using Atlas-Chat 9B
+```python
+python example/earpo.py
+```
