@@ -1,17 +1,4 @@
-# CPO Authors: Haoran Xu, Amr Sharaf, Yunmo Chen, Weiting Tan, Lingfeng Shen, Benjamin Van Durme, Kenton Murray, Young Jin Kim
-# Copyright 2024 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+
 import math
 import inspect
 import random
@@ -609,14 +596,10 @@ class CPOTrainer(Trainer):
         """
         len_chosen = policy_chosen_logps.shape[0]
         
-        ### added 2
+        
         device = policy_chosen_logps.device 
         num_non_pad_tokens = num_non_pad_tokens.to(device)
-        ### added from here
-
-        # ---------------------------------
-        # Softmax (quadratic) baseline
-        # ---------------------------------
+        
         from ..attention_registry import AttentionRegistry, Optional, Callable, Int, \
         EventDispatcherInstance
         class LinearAttentionSimilarity(nn.Module):
@@ -645,8 +628,8 @@ class CPOTrainer(Trainer):
             def forward(self,
                         chosen_hidden_states,         # (B, S, D)
                         rejected_hidden_states,       # (B, S, D)
-                        chosen_mask=None,             # (B, S) optional
-                        rejected_mask=None):          # (B, S) optional
+                        chosen_mask=None,             
+                        rejected_mask=None):          
                 # Apply the feature map to the queries and keys (same flow as LinearAttention)
                 self.feature_map.new_feature_map(chosen_hidden_states.device)
                 Q = self.feature_map.forward_queries(chosen_hidden_states)   # (B, S, D)
@@ -667,8 +650,8 @@ class CPOTrainer(Trainer):
                 Z = 1.0 / (torch.einsum("bsd,bd->bs", Q, K_sum) + self.eps)   # (B, S)
                 # ----- Row:  concentration (∑_j α_ij^2) without S×S -----
                 # tmp = Q @ KK                   (B, S, D)  ~ nlhm
-                # numerator   = <tmp, Q>         (B, S)     ~ nlh from nlhm,nlhm->nlh
-                # denominator = (Q · K_sum)^2    (B, S)     = (1/Z)^2
+                # <tmp, Q>         (B, S)     ~ nlh from nlhm,nlhm->nlh
+                #  (Q · K_sum)^2    (B, S)     = (1/Z)^2
                 tmp = torch.einsum("bsd,bdf->bsf", Q, KK)                     # (B, S, D)
                 numerator = torch.einsum("bsf,bsf->bs", tmp, Q).clamp_min(self.eps)  # (B, S)
                 denominator = (1.0 / Z).pow(2) + self.eps                     # (B, S)
@@ -683,7 +666,7 @@ class CPOTrainer(Trainer):
                 else:
                     mean_l2_sq = row_l2_sq.mean(dim=1)                        # (B,)'''
                 mean_l2_sq = row_l2_sq.mean(dim=1)
-                # Map from [1/N, 1] → [0,1], where N = effective #keys
+                # 
                 if rejected_mask is not None:
                     n_keys = rejected_mask.sum(dim=1).clamp_min(1.0)          # (B,)
                 else:
@@ -692,11 +675,9 @@ class CPOTrainer(Trainer):
                 return tau.clamp(0.0, 1.0)
 
 
-        # Register so it mirrors the pattern of LinearAttention
+        
         self.attention_similarity = LinearAttentionSimilarity(query_dimensions=policy_chosen_logits.size(-1), feature_map=elu_feature_map, eps=1e-6).to(self.model.device)
-        #self.attention_similarity = LinearAttentionSimilarity(hidden_dim=policy_chosen_logits.size(-1)).to(self.model.device)
         penalty_atten = self.attention_similarity(policy_chosen_logits, policy_rejected_logits, chosen_mask=None, rejected_mask=None)
-        #print('penalty_atten shape :', penalty_atten)
         logits = (policy_chosen_logps - (1- penalty_atten).clamp(0.0, 1.0) * policy_rejected_logps).to(self.accelerator.device)
 
         # The beta is a temperature parameter for the CPO loss, typically something in the range of 0.1 to 0.5.

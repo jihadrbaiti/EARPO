@@ -1,4 +1,17 @@
-
+# CPO Authors: Haoran Xu, Amr Sharaf, Yunmo Chen, Weiting Tan, Lingfeng Shen, Benjamin Van Durme, Kenton Murray, Young Jin Kim
+# Copyright 2024 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import inspect
 import random
@@ -40,7 +53,8 @@ if is_peft_available():
 
 if is_wandb_available():
     import wandb
-
+from ..events import EventDispatcher
+from ..feature_maps import elu_feature_map
 
 class CPOTrainer(Trainer):
     r"""
@@ -298,6 +312,11 @@ class CPOTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
+        import copy
+        self.old_model = copy.deepcopy(self.model)
+        self.old_model.eval()
+        for p in self.old_model.parameters():
+            p.requires_grad = False
 
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
@@ -307,6 +326,11 @@ class CPOTrainer(Trainer):
             raise AttributeError(
                 "Your `Trainer` does not have an `accelerator` object. Consider upgrading `transformers`."
             )
+    def update_old_policy(self):
+        self.old_model = copy.deepcopy(self.model)
+        self.old_model.eval()
+        for p in self.old_model.parameters():
+            p.requires_grad = False
 
     def build_tokenized_answer(self, prompt, answer):
         """
@@ -577,6 +601,8 @@ class CPOTrainer(Trainer):
         policy_chosen_logps: torch.FloatTensor,
         policy_rejected_logps: torch.FloatTensor,
         num_non_pad_tokens: torch.LongTensor,
+        policy_chosen_logits: torch.FloatTensor,
+        policy_rejected_logits: torch.FloatTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the CPO loss for a batch of policy and reference model log probabilities.
 
@@ -595,13 +621,86 @@ class CPOTrainer(Trainer):
         ### added 2
         device = policy_chosen_logps.device 
         num_non_pad_tokens = num_non_pad_tokens.to(device)
-        '''device2 = policy_chosen_logps.device
-        policy_rejected_logps = policy_rejected_logps.to(device2)
-        num_non_pad_tokens = num_non_pad_tokens.to(device2)'''
-        penalty = torch.abs((policy_chosen_logps / num_non_pad_tokens[:len_chosen] - policy_rejected_logps / num_non_pad_tokens[len_chosen:]))
-        penalty = torch.clamp(self.relax_cofficient_1 * torch.exp(self.relax_cofficient_2 * penalty)-1, max=1.0)
+        from ..attention_registry import AttentionRegistry, Optional, Callable, Int, \
+        EventDispatcherInstance
+        class LinearAttentionSimilarity(nn.Module):
+            """Attention-based similarity τ ∈ [0,1] in linear time (no S×S matrix).
+            Shapes:
+                chosen_hidden_states   (B, S, D)  # "queries"
+                rejected_hidden_states (B, S, D)  # "keys"
+                chosen_mask  (optional) (B, S) 1=keep, 0=pad
+                rejected_mask(optional) (B, S) 1=keep, 0=pad
+
+            API mirrors your module style:
+                __init__(query_dimensions, feature_map=None, eps=1e-6, event_dispatcher="")
+                forward(chosen_hidden_states, rejected_hidden_states,
+                        chosen_mask=None, rejected_mask=None)
+            """
+            def __init__(self, query_dimensions, feature_map=None, eps=1e-6,
+                        event_dispatcher=""):
+                super(LinearAttentionSimilarity, self).__init__()
+                self.feature_map = (
+                    feature_map(query_dimensions) if feature_map else
+                    elu_feature_map(query_dimensions)
+                )
+                self.eps = eps
+                self.event_dispatcher = EventDispatcher.get(event_dispatcher)
+
+            def forward(self,
+                        chosen_hidden_states,         # (B, S, D)
+                        rejected_hidden_states,       # (B, S, D)
+                        chosen_mask=None,             # (B, S) optional
+                        rejected_mask=None):          # (B, S) optional
+                # Apply the feature map to the queries and keys (same flow as LinearAttention)
+                self.feature_map.new_feature_map(chosen_hidden_states.device)
+                Q = self.feature_map.forward_queries(chosen_hidden_states)   # (B, S, D)
+                K = self.feature_map.forward_keys(rejected_hidden_states)    # (B, S, D)
+                # Apply key padding mask (like key_lengths in your original)
+                '''if rejected_mask is not None:
+                    if rejected_mask.dtype != torch.float32 and rejected_mask.dtype != torch.float16 and rejected_mask.dtype != torch.bfloat16:
+                        rejected_mask = rejected_mask.float()
+                    K = K * rejected_mask.unsqueeze(-1)                      # (B, S, D)'''
+
+                # ----- Linear-attention summaries (analogous to your einsums) -----
+                # K_sum = Σ_j K_j        (B, D)      # analogous to nhd in original
+                # KK    = Σ_j K_j K_j^T  (B, D, D)   # analogous to nhmd (with M=D)
+                K_sum = K.sum(dim=1)                                          # (B, D)
+                KK = torch.einsum("bsd,bsf->bdf", K, K)                       # (B, D, D)
+
+                # Normalizer Z = 1 / (Q · K_sum + eps)  (B, S)  # analogous to nlh
+                Z = 1.0 / (torch.einsum("bsd,bd->bs", Q, K_sum) + self.eps)   # (B, S)
+                # ----- Row:  concentration (∑_j α_ij^2) without S×S -----
+                # tmp = Q @ KK                   (B, S, D)  ~ nlhm
+                # numerator   = <tmp, Q>         (B, S)     ~ nlh from nlhm,nlhm->nlh
+                # denominator = (Q · K_sum)^2    (B, S)     = (1/Z)^2
+                tmp = torch.einsum("bsd,bdf->bsf", Q, KK)                     # (B, S, D)
+                numerator = torch.einsum("bsf,bsf->bs", tmp, Q).clamp_min(self.eps)  # (B, S)
+                denominator = (1.0 / Z).pow(2) + self.eps                     # (B, S)
+                row_l2_sq = numerator / denominator                           # (B, S) ∈ (0,1]
+
+                # Average over valid query positions
+                '''if chosen_mask is not None:
+                    if chosen_mask.dtype != torch.float32 and chosen_mask.dtype != torch.float16 and chosen_mask.dtype != torch.bfloat16:
+                        chosen_mask = chosen_mask.float()
+                    q_counts = chosen_mask.sum(dim=1).clamp_min(1.0)          # (B,)
+                    mean_l2_sq = (row_l2_sq * chosen_mask).sum(dim=1) / q_counts
+                else:
+                    mean_l2_sq = row_l2_sq.mean(dim=1)                        # (B,)'''
+                mean_l2_sq = row_l2_sq.mean(dim=1)
+                # Map from [1/N, 1] → [0,1], where N = effective #keys
+                if rejected_mask is not None:
+                    n_keys = rejected_mask.sum(dim=1).clamp_min(1.0)          # (B,)
+                else:
+                    n_keys = mean_l2_sq.new_full((mean_l2_sq.size(0),), float(K.size(1)))
+                tau = (n_keys * mean_l2_sq - 1.0) / (n_keys - 1.0).clamp_min(1e-6)   # (B,)
+                return tau.clamp(0.0, 1.0)
+                
         
-        logits = (policy_chosen_logps - penalty * policy_rejected_logps).to(self.accelerator.device)
+        self.attention_similarity = LinearAttentionSimilarity(query_dimensions=policy_chosen_logits.size(-1), feature_map=elu_feature_map, eps=1e-6).to(self.model.device)
+        penalty_atten = self.attention_similarity(policy_chosen_logits, policy_rejected_logits, chosen_mask=None, rejected_mask=None)
+
+        
+        logits = (policy_chosen_logps - (1- penalty_atten).clamp(0.0, 1.0) * policy_rejected_logps).to(self.accelerator.device)
 
         # The beta is a temperature parameter for the CPO loss, typically something in the range of 0.1 to 0.5.
         # We ignore the reference model as beta -> 0. The label_smoothing parameter encodes our uncertainty about the labels and
@@ -667,7 +766,8 @@ class CPOTrainer(Trainer):
 
         # dummy token; we'll ignore the losses on these tokens later
         labels[labels == label_pad_token_id] = 0
-
+        #print('logits.log_softmax(-1) shape:', logits.log_softmax(-1).shape)
+        #print('labels.unsqueeze(2) shape',labels.unsqueeze(2).shape)
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
         loss_mask = loss_mask.to(logits.device)
         if average_log_prob:
@@ -706,8 +806,10 @@ class CPOTrainer(Trainer):
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
             use_cache=False,
+            output_hidden_states=True,
             **model_kwargs,
         )
+        last_hidden_state = outputs.hidden_states[-1]
         all_logits = outputs.logits
 
         def cross_entropy_loss(logits, labels):
@@ -743,14 +845,25 @@ class CPOTrainer(Trainer):
         unique_labels = torch.unique(concatenated_batch["concatenated_labels"])
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
+        
+        chosen_hidden_states = last_hidden_state[:len_chosen]
+        rejected_hidden_states = last_hidden_state[len_chosen:]
+
+        '''mask_chosen = concatenated_batch["concatenated_attention_mask"][:len_chosen].unsqueeze(-1)  # shape: [B, L, 1]
+        chosen_embeddings = (chosen_hidden_states * mask_chosen).sum(dim=1) / mask_chosen.sum(dim=1).clamp(min=1e-5)
+        
+        mask_rejected = concatenated_batch["concatenated_attention_mask"][len_chosen:].unsqueeze(-1)
+        rejected_embeddings = (rejected_hidden_states * mask_rejected).sum(dim=1) / mask_rejected.sum(dim=1).clamp(min=1e-5)
+        chosen_embeddings = F.normalize(chosen_embeddings, p=2, dim=-1)
+        rejected_embeddings = F.normalize(rejected_embeddings, p=2, dim=-1)'''
 
         chosen_logits = all_logits[:len_chosen]
         rejected_logits = all_logits[len_chosen:]
 
         if self.aux_loss_enabled:
-            return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_logits, rejected_logits, nll_loss, outputs.aux_loss)
+            return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_hidden_states, rejected_hidden_states, chosen_logits, nll_loss, outputs.aux_loss)
 
-        return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_logits, rejected_logits, nll_loss)
+        return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_hidden_states, rejected_hidden_states, chosen_logits, nll_loss)
 
     def get_batch_loss_metrics(
         self,
@@ -768,18 +881,79 @@ class CPOTrainer(Trainer):
             policy_rejected_logps,
             policy_chosen_logits,
             policy_rejected_logits,
+            chosen_logits,
             policy_nll_loss,
-        ) = forward_output[:6]
+        ) = forward_output[:7]
         if self.aux_loss_enabled:
             aux_loss = forward_output[6]
+
+        device = policy_chosen_logits.device
+
+        concatenated_batch = self.concatenated_inputs(
+            batch,
+            is_encoder_decoder=self.is_encoder_decoder,
+            label_pad_token_id=self.label_pad_token_id,
+            padding_value=self.padding_value,
+            device=device,
+        )
+
+        len_chosen = batch["chosen_labels"].shape[0]
+        chosen_labels = batch["chosen_labels"]
+
+        #chosen_input_ids = batch["chosen_input_ids"]
+        #chosen_attention_mask = batch["chosen_attention_mask"]
+        #chosen_labels = batch["chosen_labels"]
+        old_model_kwargs = (
+            {
+                "decoder_input_ids": self._shift_right(concatenated_batch["concatenated_labels"][:len_chosen]),
+            }
+            if self.is_encoder_decoder
+            else {}
+        )        
+        with torch.no_grad():
+            #decoder_input_ids = self._shift_right(concatenated_batch["concatenated_labels"][:len_chosen])
+            old_outputs = self.old_model(
+                input_ids=concatenated_batch["concatenated_input_ids"][:len_chosen],
+                attention_mask=concatenated_batch["concatenated_attention_mask"][:len_chosen],
+                use_cache=False,
+                **old_model_kwargs,
+                #decoder_input_ids=decoder_input_ids,
+            )
+            old_chosen_logits = old_outputs.logits
+
+
+        log_probs_new = F.log_softmax(chosen_logits, dim=-1)
+        log_probs_old = F.log_softmax(old_chosen_logits, dim=-1)
+        labels = chosen_labels.clone()
+        if labels.shape[1] != log_probs_new.shape[1]:
+            labels = labels[:, :log_probs_new.shape[1]]
+        labels[labels == self.label_pad_token_id] = 0
+        #added 0
+        labels = labels.to(log_probs_new.device)
+        ##end added 
+        #labels = labels.to(log_probs_new.device) ## added device
+        log_probs_new_selected = torch.gather(log_probs_new, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+        log_probs_old_selected = torch.gather(log_probs_old, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+
+        loss_mask = (chosen_labels != self.label_pad_token_id).float().to(device)
+        log_probs_new_selected = log_probs_new_selected * loss_mask
+        log_probs_old_selected = log_probs_old_selected * loss_mask
+
+        kl = (log_probs_new_selected - log_probs_old_selected).mean()
+        kl = torch.clamp(kl, min=1-0.2, max=1+0.2) 
 
         losses, chosen_rewards, rejected_rewards = self.cpo_loss(
             policy_chosen_logps,
             policy_rejected_logps,
             num_non_pad_tokens,
+            policy_chosen_logits,
+            policy_rejected_logits
         )
+        alpha_bc = max(0.01 * (1 - self.state.global_step / 500), 0.0)  # from 0 to 0.01 (for nll_loss)
+        alpha_bc1 = 0.1 #1
+        # self.cpo_alpha
+        loss = losses.mean() + alpha_bc1 * kl + self.cpo_alpha * policy_nll_loss
 
-        loss = losses.mean() + self.cpo_alpha * policy_nll_loss
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
         prefix = "eval_" if train_eval == "eval" else ""
         metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
@@ -791,6 +965,7 @@ class CPOTrainer(Trainer):
         metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
         metrics[f"{prefix}nll_loss"] = policy_nll_loss.detach().mean().cpu()
+        metrics[f"{prefix}kl_divergence"] = kl.detach().cpu()
 
         if self.aux_loss_enabled:
             loss += getattr(model.config, "router_aux_loss_coef", 0.0) * aux_loss
@@ -810,6 +985,9 @@ class CPOTrainer(Trainer):
             )
 
         compute_loss_context_manager = torch.cuda.amp.autocast if self._peft_has_been_casted_to_bf16 else nullcontext
+
+        '''if self.state.global_step % 100 == 0:
+            self.update_old_policy()'''
 
         with compute_loss_context_manager():
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
@@ -834,10 +1012,13 @@ class CPOTrainer(Trainer):
                 attention_mask=batch["prompt_attention_mask"],
                 max_length=self.max_length,
                 do_sample=True,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
-
-        policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
+        generated_ids = policy_output.sequences
+        #policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
+        policy_output = pad_to_length(generated_ids, self.max_length, self.tokenizer.pad_token_id)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
         return policy_output_decoded

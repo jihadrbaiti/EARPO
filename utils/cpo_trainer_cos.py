@@ -577,6 +577,8 @@ class CPOTrainer(Trainer):
         policy_chosen_logps: torch.FloatTensor,
         policy_rejected_logps: torch.FloatTensor,
         num_non_pad_tokens: torch.LongTensor,
+        policy_chosen_logits: torch.FloatTensor,
+        policy_rejected_logits: torch.FloatTensor,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the CPO loss for a batch of policy and reference model log probabilities.
 
@@ -592,20 +594,49 @@ class CPOTrainer(Trainer):
         """
         len_chosen = policy_chosen_logps.shape[0]
         
-        ### added 2
         device = policy_chosen_logps.device 
         num_non_pad_tokens = num_non_pad_tokens.to(device)
-        '''device2 = policy_chosen_logps.device
-        policy_rejected_logps = policy_rejected_logps.to(device2)
-        num_non_pad_tokens = num_non_pad_tokens.to(device2)'''
-        penalty = torch.abs((policy_chosen_logps / num_non_pad_tokens[:len_chosen] - policy_rejected_logps / num_non_pad_tokens[len_chosen:]))
-        penalty = torch.clamp(self.relax_cofficient_1 * torch.exp(self.relax_cofficient_2 * penalty)-1, max=1.0)
-        
-        logits = (policy_chosen_logps - penalty * policy_rejected_logps).to(self.accelerator.device)
+        def cosine_similarity_from_embeddings(
+            embeddings1: torch.Tensor,
+            embeddings2: torch.Tensor
+        ) -> torch.Tensor:
+            """
+            Calculates the cosine similarity between two sets of response embeddings.
 
-        # The beta is a temperature parameter for the CPO loss, typically something in the range of 0.1 to 0.5.
-        # We ignore the reference model as beta -> 0. The label_smoothing parameter encodes our uncertainty about the labels and
-        # calculates a conservative CPO loss.
+            Args:
+                embeddings1 (torch.Tensor): PyTorch tensor of shape [batch_size, embedding_dim].
+                                            Represents embeddings for the first set of responses (e.g., chosen).
+                embeddings2 (torch.Tensor): PyTorch tensor of shape [batch_size, embedding_dim].
+                                            Represents embeddings for the second set of responses (e.g., rejected).
+
+            Returns:
+                torch.Tensor: A 1D tensor of shape [batch_size] containing the cosine similarity
+                            score for each corresponding response pair.
+
+            Raises:
+                ValueError: If input tensors do not have 2 dimensions or have mismatching shapes.
+            """
+            if embeddings1.dim() != 2 or embeddings2.dim() != 2:
+                raise ValueError("Input embedding tensors must have 2 dimensions: [batch_size, embedding_dim]. "
+                                f"Got shapes {embeddings1.shape} and {embeddings2.shape}.")
+
+            if embeddings1.shape != embeddings2.shape:
+                raise ValueError(
+                    f"Input embedding tensors must have matching shapes. "
+                    f"Got {embeddings1.shape} for embeddings1 and {embeddings2.shape} for embeddings2."
+                )
+
+            cosine_similarities = F.cosine_similarity(embeddings1, embeddings2, dim=1)
+
+            return cosine_similarities
+            
+        def scale_cosine_similarity_torch(cosine_similarities):
+            scaled_similarities = (cosine_similarities + 1) / 2
+            return scaled_similarities
+        
+        penalty_cos = scale_cosine_similarity_torch(cosine_similarity_from_embeddings(policy_chosen_logits, policy_rejected_logits))        
+        
+        logits = (policy_chosen_logps - (1- penalty_cos).clamp(0.0, 1.0) * policy_rejected_logps).to(self.accelerator.device)
 
         if self.loss_type == "simpo":
             gamma_logratios = self.simpo_gamma / self.beta
@@ -706,8 +737,10 @@ class CPOTrainer(Trainer):
             concatenated_batch["concatenated_input_ids"],
             attention_mask=concatenated_batch["concatenated_attention_mask"],
             use_cache=False,
+            output_hidden_states=True,
             **model_kwargs,
         )
+        last_hidden_state = outputs.hidden_states[-1]
         all_logits = outputs.logits
 
         def cross_entropy_loss(logits, labels):
@@ -743,14 +776,24 @@ class CPOTrainer(Trainer):
         unique_labels = torch.unique(concatenated_batch["concatenated_labels"])
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
+        chosen_hidden_states = last_hidden_state[:len_chosen]
+        rejected_hidden_states = last_hidden_state[len_chosen:]
+        #print('chosen_hidden_states shape:', chosen_hidden_states.shape)
 
-        chosen_logits = all_logits[:len_chosen]
-        rejected_logits = all_logits[len_chosen:]
-
+        mask_chosen = concatenated_batch["concatenated_attention_mask"][:len_chosen].unsqueeze(-1)  # shape: [B, L, 1]
+        chosen_embeddings = (chosen_hidden_states * mask_chosen).sum(dim=1) / mask_chosen.sum(dim=1).clamp(min=1e-5)
+        
+        mask_rejected = concatenated_batch["concatenated_attention_mask"][len_chosen:].unsqueeze(-1)
+        rejected_embeddings = (rejected_hidden_states * mask_rejected).sum(dim=1) / mask_rejected.sum(dim=1).clamp(min=1e-5)
+        chosen_embeddings = F.normalize(chosen_embeddings, p=2, dim=-1)
+        rejected_embeddings = F.normalize(rejected_embeddings, p=2, dim=-1)
+        #chosen_logits = all_logits[:len_chosen]
+        #rejected_logits = all_logits[len_chosen:]
+        
         if self.aux_loss_enabled:
-            return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_logits, rejected_logits, nll_loss, outputs.aux_loss)
+            return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_embeddings, rejected_embeddings, nll_loss, outputs.aux_loss)
 
-        return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_logits, rejected_logits, nll_loss)
+        return (num_non_pad_tokens, chosen_logps, rejected_logps, chosen_embeddings, rejected_embeddings, nll_loss)
 
     def get_batch_loss_metrics(
         self,
@@ -777,6 +820,8 @@ class CPOTrainer(Trainer):
             policy_chosen_logps,
             policy_rejected_logps,
             num_non_pad_tokens,
+            policy_chosen_logits,
+            policy_rejected_logits
         )
 
         loss = losses.mean() + self.cpo_alpha * policy_nll_loss
@@ -834,10 +879,14 @@ class CPOTrainer(Trainer):
                 attention_mask=batch["prompt_attention_mask"],
                 max_length=self.max_length,
                 do_sample=True,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
-
-        policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
+        generated_ids = policy_output.sequences
+        #added
+        #policy_output = pad_to_length(policy_output, self.max_length, self.tokenizer.pad_token_id)
+        policy_output = pad_to_length(generated_ids, self.max_length, self.tokenizer.pad_token_id)
         policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
 
         return policy_output_decoded
